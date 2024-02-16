@@ -83,6 +83,27 @@ def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_
     return SelectiveScanFn.apply(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
 
 
+@torch.no_grad()
+def quantize_activation_per_tensor_absmax(t, n_bits=8):
+    t_shape = t.shape
+    t.view(-1, t_shape[-1])
+    scales = t.abs().max()
+    q_max = 2**(n_bits-1)-1
+    scales.clamp_(min=1e-5).div_(q_max)
+    t.div_(scales).round_().mul_(scales)
+    return t
+
+
+@torch.no_grad()
+def quantize_channel_per_state_absmax(x, n_bits=8):
+    # x: (bsize, dim, nstate), e.g.,[1, 1536, 16]
+    scales = x.abs().max(dim=2, keepdim=True)[0] # [1, 1536, 1]
+    q_max = 2**(n_bits-1)-1
+    scales.clamp_(min=1e-5).div_(q_max)
+    x.div_(scales).round_().mul_(scales)
+    return x
+
+
 def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
                       return_last_state=False):
     """
@@ -98,6 +119,13 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
     out: r(B D L)
     last_state (optional): r(B D dstate) or c(B D dstate)
     """
+    # print("u.shape: ", u.shape)
+    # print("delta.shape: ", delta.shape)
+    # print("A.shape: ", A.shape)
+    # print("B.shape: ", B.shape)
+    # print("C.shape: ", C.shape)
+    # print("D.shape: ",  D.shape)
+    
     dtype_in = u.dtype
     u = u.float()
     delta = delta.float()
@@ -123,6 +151,10 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
         deltaB_u = torch.einsum('bdl,dn,bdl->bdln', delta, B, u)
     else:
         if B.dim() == 3:
+            """
+            tmp = torch.einsum('bdl,bnl->bdln', t, B)
+            deltaB_u_ = torch.einsum('bdln,bdl->bdln', tmp, u)
+            """
             deltaB_u = torch.einsum('bdl,bnl,bdl->bdln', delta, B, u)
         else:
             B = repeat(B, "B G N L -> B (G H) N L", H=dim // B.shape[1])
@@ -130,13 +162,41 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
     if is_variable_C and C.dim() == 4:
         C = repeat(C, "B G N L -> B (G H) N L", H=dim // C.shape[1])
     last_state = None
+
+    """
+    print("deltaA.shape: ",  deltaA.shape)
+    print("x.shape: ",  x.shape)
+    print("deltaB_u.shape: ",  deltaB_u.shape)
+    print("u.shape: ", u.shape, u.shape[2])
+    deltaA.shape:  torch.Size([1, 1536, 14, 16])
+    x.shape:  torch.Size([1, 1536, 16])                                                                        
+    deltaB_u.shape:  torch.Size([1, 1536, 14, 16])
+    u.shape:  torch.Size([1, 1536, 14]) 14
+    """
+    # deltaA = quantize_activation_temporal_absmax(deltaA, n_bits=8)
+    # deltaB_u = quantize_activation_temporal_absmax(deltaB_u, n_bits=8)
     for i in range(u.shape[2]):
-        x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
+        """
+        torch.Size([1, 1536, 16]) torch.Size([1, 1536, 16]) torch.Size([1, 1536, 16])
+        print(x.shape, deltaA_i.shape, deltaB_u_i.shape)
+        """
+        # x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
+        deltaA_i = quantize_activation_per_tensor_absmax(deltaA[:, :, i], n_bits=8)
+        deltaB_u_i = quantize_channel_per_state_absmax(deltaB_u[:, :, i], n_bits=8)
+        x = deltaA_i * x + deltaB_u_i
+        # x = quantize_activation_per_tensor_absmax(x, n_bits=8)
         if not is_variable_C:
             y = torch.einsum('bdn,dn->bd', x, C)
         else:
             if C.dim() == 3:
-                y = torch.einsum('bdn,bn->bd', x, C[:, :, i])
+                x_ = quantize_activation_per_tensor_absmax(x.clone(), n_bits=8)
+                y = torch.einsum('bdn,bn->bd', x_, C[:, :, i])
+                # y = torch.einsum('bdn,bn->bd', x, C[:, :, i])
+                # y = quantize_activation_per_tensor_absmax(y, n_bits=8) # should we quantize y here?
+                """
+                torch.Size([1, 1536, 16]) torch.Size([1, 16, 14]) torch.Size([1, 16]) torch.Size([1, 1536])
+                print(x.shape, C.shape, C[:, :, i].shape, y.shape)
+                """
             else:
                 y = torch.einsum('bdn,bdn->bd', x, C[:, :, :, i])
         if i == u.shape[2] - 1:
@@ -144,11 +204,22 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
         if y.is_complex():
             y = y.real * 2
         ys.append(y)
+    """
+    print(len(ys), y.shape)
+    14 torch.Size([1, 1536, 14])
+    """
     y = torch.stack(ys, dim=2) # (batch dim L)
     out = y if D is None else y + u * rearrange(D, "d -> d 1")
     if z is not None:
         out = out * F.silu(z)
     out = out.to(dtype=dtype_in)
+    # out = quantize_activation_per_tensor_absmax(out, n_bits=8) # should not be quantized here
+    """
+    print("out.shape: ",  out.shape)
+    print("last_state.shape: ",  last_state.shape)
+    out.shape:  torch.Size([1, 1536, 14])
+    last_state.shape:  torch.Size([1, 1536, 16]
+    """
     return out if not return_last_state else (out, last_state)
 
 

@@ -10,12 +10,13 @@ from torch import Tensor
 
 from einops import rearrange, repeat
 
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn, selective_scan_ref
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 except ImportError:
     causal_conv1d_fn, causal_conv1d_update = None
+causal_conv1d_fn, causal_conv1d_update = None, None
 
 try:
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
@@ -26,6 +27,27 @@ try:
     from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
+
+
+
+@torch.no_grad()
+def quantize_activation_per_tensor_absmax(t, n_bits=8):
+    t_shape = t.shape
+    t.view(-1, t_shape[-1])
+    scales = t.abs().max()
+    q_max = 2**(n_bits-1)-1
+    scales.clamp_(min=1e-5).div_(q_max)
+    t.div_(scales).round_().mul_(scales)
+    return t
+
+@torch.no_grad()
+def quantize_state_per_token_absmax(x, n_bits=8):
+    # x: (bsize, nstate, seqlen), e.g.,[1, 16, 512]
+    scales = x.abs().max(dim=1, keepdim=True)[0] # [1, 1, 512]
+    q_max = 2**(n_bits-1)-1
+    scales.clamp_(min=1e-5).div_(q_max)
+    x.div_(scales).round_().mul_(scales)
+    return x
 
 
 class Mamba(nn.Module):
@@ -116,6 +138,94 @@ class Mamba(nn.Module):
 
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
 
+
+    def quant(self, act_scales=None):
+        
+        @torch.no_grad()
+        def quantize_weight_per_tensor_absmax(w, n_bits=8):
+            # w: (out_features, in_features)
+            scales = w.abs().max()
+            q_max = 2**(n_bits-1)-1
+            scales.clamp_(min=1e-5).div_(q_max)
+            w.div_(scales).round_().mul_(scales)
+            return w
+
+        @torch.no_grad()
+        def smooth_fc(weight, act_scale, alpha=0.5):
+            device = weight.device
+            dtype = weight.dtype
+            act_scale = act_scale.to(device).to(dtype)
+            # linear fc weight shape [out_dim, in_dim]
+            weight_scale = weight.abs().max(dim=0, keepdim=True)[0].clamp(min=1e-5) # [out_dim, in_dim] -> [1, in_dim]
+            sm_scale = (act_scale[None, :].pow(alpha) / weight_scale.pow(1-alpha)).clamp(
+                min=1e-5).to(device).to(dtype)
+            return weight.mul_(sm_scale), sm_scale
+
+        @torch.no_grad()
+        def smooth_conv1d(weight, act_scale, alpha=0.5):
+            device = weight.device
+            dtype = weight.dtype
+            act_scale = act_scale.to(device).to(dtype)
+            # depth-wise conv1d weight shape [in_dim, 1, ksize]
+            weight_scale = weight.abs().max(dim=2, keepdim=True)[0].clamp(min=1e-5) # [in_dim, 1, ksize] -> [in_dim, 1, 1]
+            # act_scale[:, None, None] shape: [in_dim, 1, 1],  weight_scale shape: [in_dim, 1, 1]
+            sm_scale = (act_scale[:, None, None].pow(alpha) / weight_scale.pow(1-alpha)).clamp(
+                min=1e-5).to(device).to(dtype)
+            return weight.mul_(sm_scale), torch.squeeze(sm_scale)[None, :, None]  # [in_dim] -> [1, in_dim, 1]
+        
+        """in_proj"""
+        if act_scales is not None and "in_proj" in act_scales.keys():
+            weight, self.in_proj_scale = smooth_fc(self.in_proj.weight, act_scales["in_proj"], alpha=0.5)
+        else:
+            weight = self.in_proj.weight
+            self.in_proj_scale = torch.ones((1, weight.shape[1]), device=weight.device, dtype=weight.dtype)
+        self.in_proj.weight = quantize_weight_per_tensor_absmax(weight)
+        if self.in_proj.bias is not None:
+            self.in_proj.bias = quantize_weight_per_tensor_absmax(self.in_proj.bias)
+
+        """conv1d"""
+        if act_scales is not None and "conv1d" in act_scales.keys():
+            weight, self.conv1d_scale = smooth_conv1d(self.conv1d.weight, act_scales["conv1d"], alpha=0.5)
+        else:
+            weight = self.conv1d.weight
+            self.conv1d_scale = torch.ones((1, weight.shape[0], 1), device=weight.device, dtype=weight.dtype)
+        self.conv1d.weight = quantize_weight_per_tensor_absmax(weight)
+        if self.conv1d.bias is not None:
+            self.conv1d.bias = quantize_weight_per_tensor_absmax(self.conv1d.bias)
+
+        """x_proj"""
+        if act_scales is not None and "x_proj" in act_scales.keys():
+            weight, self.x_proj_scale = smooth_fc(self.x_proj.weight, act_scales["x_proj"], alpha=0.5)
+        else:
+            weight = self.x_proj.weight
+            self.x_proj_scale = torch.ones((1, weight.shape[1]), device=weight.device, dtype=weight.dtype)
+        self.x_proj.weight = quantize_weight_per_tensor_absmax(weight)
+        self.x_proj.weight = quantize_weight_per_tensor_absmax(self.x_proj.weight)
+
+        """dt_proj"""
+        if act_scales is not None and "dt_proj" in act_scales.keys():
+            weight, self.dt_proj_scale = smooth_fc(self.dt_proj.weight, act_scales["dt_proj"], alpha=0.5)
+        else:
+            weight = self.dt_proj.weight
+            self.dt_proj_scale = torch.ones((1, weight.shape[1]), device=weight.device, dtype=weight.dtype)
+        self.dt_proj.weight = quantize_weight_per_tensor_absmax(weight)
+        self.dt_proj.bias = quantize_weight_per_tensor_absmax(self.dt_proj.bias)
+
+        """out_proj"""
+        if act_scales is not None and "out_proj" in act_scales.keys():
+            weight, self.out_proj_scale = smooth_fc(self.out_proj.weight, act_scales["out_proj"], alpha=0.5)
+        else:
+            weight = self.out_proj.weight
+            self.out_proj_scale = torch.ones((1, weight.shape[1]), device=weight.device, dtype=weight.dtype)
+        self.out_proj.weight = quantize_weight_per_tensor_absmax(weight)
+        if self.out_proj.bias is not None:
+            self.out_proj.bias = quantize_weight_per_tensor_absmax(self.out_proj.bias)
+        
+        """A_log"""
+        self.A_log = quantize_weight_per_tensor_absmax(self.A_log)
+        """D"""
+        self.D = quantize_weight_per_tensor_absmax(self.D)
+
     def forward(self, hidden_states, inference_params=None):
         """
         hidden_states: (B, L, D)
@@ -131,6 +241,8 @@ class Mamba(nn.Module):
                 out, _, _ = self.step(hidden_states, conv_state, ssm_state)
                 return out
 
+        # hidden_states = quantize_activation_per_tensor_absmax(hidden_states, n_bits=8) # Naive
+        hidden_states = quantize_activation_per_tensor_absmax(hidden_states.div(self.in_proj_scale), n_bits=8) # smooth quant hurts acc  0.76 -> 0.754
         # We do matmul and transpose BLH -> HBL at the same time
         xz = rearrange(
             self.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
@@ -166,6 +278,8 @@ class Mamba(nn.Module):
                 # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
                 conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
             if causal_conv1d_fn is None:
+                # x = quantize_activation_per_tensor_absmax(x, n_bits=8)  # naive
+                x = quantize_activation_per_tensor_absmax(x.div(self.conv1d_scale), n_bits=8) # smooth quant does not make much difference
                 x = self.act(self.conv1d(x)[..., :seqlen])
             else:
                 assert self.activation in ["silu", "swish"]
@@ -179,14 +293,32 @@ class Mamba(nn.Module):
             # We're careful here about the layout, to avoid extra transposes.
             # We want dt to have d as the slowest moving dimension
             # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
-            x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))  # (bl d)
+            # x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))  # (bl d) we divide into a few steps to apply quantization
+            x_reshape = rearrange(x, "b d l -> (b l) d")
+            # x_reshape = quantize_activation_per_tensor_absmax(x_reshape, n_bits=8) # naive
+            x_reshape = quantize_activation_per_tensor_absmax(x_reshape.div(self.x_proj_scale), n_bits=8) # smooth quant !!! 0.729 -> 0.76 
+            x_dbl = self.x_proj(x_reshape)  # (bl d)
+
             dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+            # dt = quantize_activation_per_tensor_absmax(dt, n_bits=8) # naive
+            dt = quantize_activation_per_tensor_absmax(dt.div(self.dt_proj_scale), n_bits=8) # smooth quant!!! 0.756 -> 0.76
             dt = self.dt_proj.weight @ dt.t()
+            
             dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
             B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+
             assert self.activation in ["silu", "swish"]
-            y = selective_scan_fn(
+            x = quantize_activation_per_tensor_absmax(x, n_bits=8) # naive
+            dt = quantize_activation_per_tensor_absmax(dt, n_bits=8) # naive
+            # A = quantize_activation_per_tensor_absmax(A.clamp_(min=-5), n_bits=8) # naive
+            B = quantize_activation_per_tensor_absmax(B, n_bits=8) # naive
+            C = quantize_activation_per_tensor_absmax(C, n_bits=8) # naive
+            z = quantize_activation_per_tensor_absmax(z, n_bits=8) # naive
+            # B = quantize_state_per_token_absmax(B, n_bits=8)
+            # C = quantize_state_per_token_absmax(C, n_bits=8)
+            # y = selective_scan_fn(
+            y = selective_scan_ref(
                 x,
                 dt,
                 A,
@@ -202,6 +334,8 @@ class Mamba(nn.Module):
                 y, last_state = y
                 ssm_state.copy_(last_state)
             y = rearrange(y, "b d l -> b l d")
+            y = quantize_activation_per_tensor_absmax(y.div(self.out_proj_scale), n_bits=8) # smooth quant!!! 0.723 -> 0.76
+            # y = quantize_activation_per_tensor_absmax(y, n_bits=8) # naive
             out = self.out_proj(y)
         return out
 
@@ -351,3 +485,49 @@ class Block(nn.Module):
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+
+
+if __name__ == "__main__":
+    from functools import partial
+    """
+    MambaConfig(
+        d_model=768, n_layer=24, vocab_size=50277,
+        ssm_cfg={}, rms_norm=True, residual_in_fp32=True,
+        fused_add_norm=True, pad_vocab_size_multiple=8
+    )
+    """
+    device = "cuda"
+    dtype = torch.float16
+    norm_epsilon = 1e-5
+
+    d_model = 768
+    layer_idx = 0
+    ssm_cfg = {}
+    factory_kwargs = {"device": device, "dtype": dtype}
+    rms_norm = True
+    residual_in_fp32 = True
+    fused_add_norm=True
+    mixer_cls = partial(Mamba, layer_idx=layer_idx, **ssm_cfg, **factory_kwargs)
+    norm_cls = partial(
+        nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
+    )
+    block = Block(
+        d_model,
+        mixer_cls,
+        norm_cls=norm_cls,
+        fused_add_norm=fused_add_norm,
+        residual_in_fp32=residual_in_fp32,
+    )
+    block.layer_idx = layer_idx
+    print(block)
+
+    # batch, seqlen, dim
+    batch = 4
+    seqlen = 8192
+    dim = 768
+    hidden_states = torch.rand((batch, seqlen, dim), device=device, dtype=dtype)
+    residual = torch.rand((batch, seqlen, dim), device=device, dtype=dtype)
+    # residual = None
+    print(hidden_states.shape, residual.shape)
+    hidden_states, residual = block(hidden_states, residual)
+    print(hidden_states.shape, residual.shape)

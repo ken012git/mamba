@@ -1,5 +1,5 @@
 # Copyright (c) 2023, Tri Dao, Albert Gu.
-
+import os
 import argparse
 import time
 import json
@@ -12,6 +12,19 @@ from einops import rearrange
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+
+from hooks import add_hooks
+
+
+def get_model_size(model, temp_dir="/tmp"):
+
+    model_dir = os.path.join(temp_dir, "temp")
+    torch.save(model.state_dict(), model_dir)
+    # model.save_pretrained(model_dir)
+    size = os.path.getsize(model_dir)
+    os.remove(model_dir)
+    
+    return size
 
 
 parser = argparse.ArgumentParser(description="Generation benchmarking")
@@ -42,6 +55,14 @@ else:
 model.eval()
 print(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
+# add_hooks(model, "layer_profile") # dumpy layer weights and activations
+
+# model_size = get_model_size(model)
+# print("FP32 Model Size: {:.2f} MB".format(model_size / (2 ** 20)))
+# model = torch.quantization.quantize_dynamic(model, {torch.nn.Linear, torch.nn.Conv1d}, dtype=torch.qint8)
+# model_size = get_model_size(model)
+# print("INT8 Model Size: {:.2f} MB".format(model_size / (2 ** 20)))
+
 torch.random.manual_seed(0)
 if args.prompt is None:
     input_ids = torch.randint(1, 1000, (args.batch, args.promptlen), dtype=torch.long, device="cuda")
@@ -50,13 +71,18 @@ else:
     tokens = tokenizer(args.prompt, return_tensors="pt")
     input_ids = tokens.input_ids.to(device=device)
     attn_mask = tokens.attention_mask.to(device=device)
+    print(tokens)
+    print(input_ids)
+    print(attn_mask)
 max_length = input_ids.shape[1] + args.genlen
+print(input_ids.shape[1], args.genlen, max_length)
 
 if is_mamba:
     fn = lambda: model.generate(
         input_ids=input_ids,
         max_length=max_length,
-        cg=True,
+        # cg=True,
+        cg=False,  # do not cache graph for debugging
         return_dict_in_generate=True,
         output_scores=True,
         enable_timing=False,
@@ -81,12 +107,12 @@ else:
     )
 out = fn()
 if args.prompt is not None:
-    print(tokenizer.batch_decode(out.sequences.tolist()))
+    print(tokenizer.batch_decode(out.sequences.tolist())[0])
 
-torch.cuda.synchronize()
-start = time.time()
-for _ in range(repeats):
-    fn()
-torch.cuda.synchronize()
-print(f"Prompt length: {len(input_ids[0])}, generation length: {len(out.sequences[0]) - len(input_ids[0])}")
-print(f"{args.model_name} prompt processing + decoding time: {(time.time() - start) / repeats * 1000:.0f}ms")
+# torch.cuda.synchronize()
+# start = time.time()
+# for _ in range(repeats):
+#     fn()
+# torch.cuda.synchronize()
+# print(f"Prompt length: {len(input_ids[0])}, generation length: {len(out.sequences[0]) - len(input_ids[0])}")
+# print(f"{args.model_name} prompt processing + decoding time: {(time.time() - start) / repeats * 1000:.0f}ms")
